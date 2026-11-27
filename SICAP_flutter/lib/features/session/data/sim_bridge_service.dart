@@ -19,7 +19,9 @@ final simBridgeProvider =
 class SimBridgeService extends ChangeNotifier {
   static const int port = 47800;
   static const int protocolVersion = 1;
-  static const int samplesPerPacket = 5;
+  /// El maniquí da unas 11 muestras por segundo: con 2 por paquete las gafas y el
+  /// PC muestran cada compresión con menos de 0,2 s de retraso.
+  static const int samplesPerPacket = 2;
   static const probePacket = '{"probe":1}';
   static const _probeEvery = Duration(seconds: 3);
   static const _lostAfter = Duration(seconds: 8);
@@ -34,8 +36,10 @@ class SimBridgeService extends ChangeNotifier {
   Future<RawDatagramSocket?>? _opening;
   Timer? _probeTimer;
   InternetAddress? _manual;
-  InternetAddress? _found;
-  DateTime _lastReply = DateTime.fromMillisecondsSinceEpoch(0);
+  /// Simuladores que respondieron (PC del aula, otro PC...), con su última respuesta.
+  /// La sesión se envía a todos a la vez; SICAP VR del propio teléfono va por loopback.
+  final Map<String, InternetAddress> _found = {};
+  final Map<String, DateTime> _lastReply = {};
   List<InternetAddress> _broadcasts = [InternetAddress('255.255.255.255')];
   Set<String> _ownAddresses = const {};
   bool _alsoLocal = false;
@@ -52,7 +56,7 @@ class SimBridgeService extends ChangeNotifier {
   String get target => _target;
 
   /// IP del simulador que respondió a la búsqueda.
-  String? get simulatorAddress => _found?.address;
+  String? get simulatorAddress => _found.isEmpty ? null : _found.keys.join(', ');
 
   Future<void> load() async {
     if (_loaded) return;
@@ -171,16 +175,22 @@ class SimBridgeService extends ChangeNotifier {
   }
 
   void _probe() {
-    if (_found != null &&
-        DateTime.now().difference(_lastReply) > _lostAfter) {
-      _found = null;
-      notifyListeners();
+    final now = DateTime.now();
+    final lost = _lastReply.entries
+        .where((e) => now.difference(e.value) > _lostAfter)
+        .map((e) => e.key)
+        .toList();
+    for (final address in lost) {
+      _found.remove(address);
+      _lastReply.remove(address);
     }
-    unawaited(_findBroadcasts().whenComplete(() => _send(probePacket)));
+    if (lost.isNotEmpty) notifyListeners();
+    // La búsqueda sigue aunque ya haya uno: así aparece también el PC cuando se
+    // usa con las gafas, o un segundo PC.
+    unawaited(_findBroadcasts().whenComplete(() => _send(probePacket, probe: true)));
   }
 
   Future<void> _findBroadcasts() async {
-    if (_found != null) return;
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
@@ -201,29 +211,32 @@ class SimBridgeService extends ChangeNotifier {
     }
   }
 
-  Iterable<InternetAddress> get _destinations {
+  Iterable<InternetAddress> _destinations({bool probe = false}) {
     final local = _alsoLocal ? [InternetAddress.loopbackIPv4] : const <InternetAddress>[];
-    final found = _found;
-    if (found != null) return [found, ...local];
     final manual = _manual;
-    return manual == null ? [..._broadcasts, ...local] : [manual, ..._broadcasts, ...local];
+    final search = [if (manual != null) manual, ..._broadcasts];
+    if (_found.isEmpty) return [...search, ...local];
+    // Las búsquedas van a toda la red; los datos, solo a quien respondió.
+    return probe
+        ? {..._found.values, ...search}.toList()
+        : [..._found.values, ...local];
   }
 
-  void _send(String packet) {
+  void _send(String packet, {bool probe = false}) {
     final bytes = utf8.encode(packet);
     final socket = _socket;
     if (socket != null) {
-      _deliver(socket, bytes);
+      _deliver(socket, bytes, probe: probe);
       return;
     }
     _open().then((opened) {
-      if (opened != null) _deliver(opened, bytes);
+      if (opened != null) _deliver(opened, bytes, probe: probe);
     });
   }
 
-  void _deliver(RawDatagramSocket socket, List<int> bytes) {
+  void _deliver(RawDatagramSocket socket, List<int> bytes, {bool probe = false}) {
     try {
-      for (final address in _destinations) {
+      for (final address in _destinations(probe: probe)) {
         socket.send(bytes, address, port);
       }
     } catch (e) {
@@ -257,12 +270,11 @@ class SimBridgeService extends ChangeNotifier {
     if (!isSimulatorReply(utf8.decode(reply.data, allowMalformed: true))) return;
     if (reply.address.isLoopback || _ownAddresses.contains(reply.address.address)) return;
 
-    final found = _found;
-    if (found != null && found != reply.address) return;
-    _lastReply = DateTime.now();
-    if (found == null) {
-      _found = reply.address;
-      debugPrint('SimBridge: simulador en ${reply.address.address}');
+    final key = reply.address.address;
+    _lastReply[key] = DateTime.now();
+    if (!_found.containsKey(key)) {
+      _found[key] = reply.address;
+      debugPrint('SimBridge: simulador en $key');
       notifyListeners();
     }
   }
@@ -276,7 +288,8 @@ class SimBridgeService extends ChangeNotifier {
     _probeTimer?.cancel();
     _probeTimer = null;
     _closeSocket();
-    _found = null;
+    _found.clear();
+    _lastReply.clear();
     _samples.clear();
   }
 
